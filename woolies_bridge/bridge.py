@@ -127,10 +127,14 @@ def summarise_cart(d: dict) -> dict:
             log("cart product keys", sorted(p.keys()))
         var = li.get("productVariantSku") or ""
         sku = str(li.get("sku") or var.split("-")[0])
-        name = (p.get("name") or p.get("productName") or p.get("displayName") or p.get("title")
-                or names.get(sku) or var)
+        vs = [v for v in (p.get("variants") or []) if isinstance(v, dict)]
+        vv = next((v for v in vs if v.get("variantKey") == var or v.get("sku") == var), vs[0] if vs else {})
+        name = (vv.get("name") or p.get("name") or p.get("productName") or names.get(sku) or var)
         tot = li.get("lineTotal") or {}
-        img = p.get("imageUrl") or p.get("image") or ""
+        img = p.get("imageUrl") or ""
+        for a in (vv.get("assets") or []) + (p.get("assets") or []):
+            if not img and isinstance(a, dict):
+                img = a.get("url") or a.get("imageUrl") or ""
         lines.append({"sku": sku, "variant": var, "kg": var.endswith("-KG"), "qty": li.get("quantity"),
                       "cents": tot.get("afterDiscountAsCents"), "saved": tot.get("discountAmountAsCents") or 0,
                       "name": name, "brand": p.get("brand") or "", "img": img if isinstance(img, str) else ""})
