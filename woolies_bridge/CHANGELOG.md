@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.3
+- New `diag` request: logs what the headless browser sees on the Woolworths home page (sign-in links, cookie names, page text), to work out sign-in problems.
+
 ## 0.1.2
 - Trolley adds now run inside the signed-in browser, the way the website does them. Woolworths refused them from the plain HTTP client, and 0.1.0/0.1.1 then signed in again for every item (about a minute each).
 - Each failed item is written to the log with Woolworths' answer.

@@ -173,6 +173,30 @@ async def add_items(items: list) -> dict:
     return {"added": done, "failed": failed}
 
 
+DIAG_JS = """() => {
+  const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const pick = [...document.querySelectorAll('a, button')].filter(vis)
+    .map((e) => (e.tagName + ':' + (e.innerText || e.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ')
+      + (e.getAttribute('href') ? ' -> ' + e.getAttribute('href') : '')).slice(0, 120))
+    .filter((t) => /sign|log|account|my |register|hi /i.test(t));
+  return {url: location.href, title: document.title, links: pick.slice(0, 25),
+          cookies: document.cookie.split('; ').map((c) => c.split('=')[0]),
+          body: (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 600)};
+}"""
+
+
+async def diag() -> dict:
+    """What the headless browser sees on the home page (for working out sign-in problems). No secrets logged."""
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(6000)
+        d = await page.evaluate(DIAG_JS)
+    for k in ("url", "title", "links", "cookies", "body"):
+        log("diag", k, json.dumps(d.get(k), ensure_ascii=False)[:1500])
+    return d
+
+
 async def handle(session: aiohttp.ClientSession, req: dict):
     op = req.get("op")
     if op == "status":
@@ -192,12 +216,14 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add"):
+    if op not in ("login", "search", "cart", "add", "diag"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
         try:
-            if op == "login":
+            if op == "diag":
+                out = await diag()
+            elif op == "login":
                 bs = BrowserSession(headless=True)
                 async with bs as page:
                     await bs.ensure_logged_in(page)
