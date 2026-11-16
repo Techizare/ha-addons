@@ -26,4 +26,4 @@ The source is plain script split into parts that are joined in name order (no im
 
 1. Edit the parts in `src/`, bump `MP_VERSION` in `10-dates-aisles.js`, add a line to the history in `00-header.js`.
 2. Run `./build.sh` (needs Node). It checks the syntax and writes `../dist/meal-planner-card.js`.
-3. Commit `src/` and `dist/` together, then publish a GitHub release tagged `vX.Y.Z` so HACS offers the update.
+3. Commit `src/` and `dist/` together and push to `main`. The repo has no releases, so HACS follows `main` and offers each new commit as an update (Settings → Updates, or HACS → Meal Planner Card → Redownload).

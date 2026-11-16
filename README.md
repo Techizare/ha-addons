@@ -14,4 +14,4 @@ This repository is also a HACS **Dashboard** repository for the meal planner and
 
 In HACS: **⋮ → Custom repositories**, add `https://github.com/Techizare/ha-addons` with type **Dashboard**,
 then download **Meal Planner Card**. HACS adds the dashboard resource
-`/hacsfiles/ha-addons/meal-planner-card.js` and offers each new release as an update.
+`/hacsfiles/ha-addons/meal-planner-card.js` and offers each new commit on `main` as an update.
