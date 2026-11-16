@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.4
+- `diag` also lists the headers the website itself sends on its API calls (names only) and all cookie names.
+
 ## 0.1.3
 - New `diag` request: logs what the headless browser sees on the Woolworths home page (sign-in links, cookie names, page text), to work out sign-in problems.
 

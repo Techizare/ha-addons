@@ -188,11 +188,22 @@ DIAG_JS = """() => {
 async def diag() -> dict:
     """What the headless browser sees on the home page (for working out sign-in problems). No secrets logged."""
     bs = BrowserSession(headless=True)
+    seen = []
+
+    def on_req(r):
+        if "/api/" in r.url and len(seen) < 12:
+            h = r.headers
+            seen.append(f"{r.method} {r.url.split('?')[0][-60:]} hdrs={sorted(h.keys())} "
+                        f"xsrf={'x-xsrf-token' in h} auth={'authorization' in h}")
+
     async with bs as page:
+        page.on("request", on_req)
         await page.goto("https://www.woolworths.co.nz")
         await page.wait_for_timeout(6000)
         d = await page.evaluate(DIAG_JS)
-    for k in ("url", "title", "links", "cookies", "body"):
+        d["all_cookies"] = sorted({c["name"] for c in await page.context.cookies()})
+        d["api"] = seen
+    for k in ("url", "title", "links", "cookies", "all_cookies", "api"):
         log("diag", k, json.dumps(d.get(k), ensure_ascii=False)[:1500])
     return d
 
