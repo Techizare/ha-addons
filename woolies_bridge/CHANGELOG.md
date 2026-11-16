@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.6
+- Click & collect: `slots` with `method: pickup` lists pickup times at the chosen store (remembered; Claudelands to start), one per time, preferring to-the-boot. `stores` searches Woolworths stores by name.
+- The trolley snapshot's `slot_info` also carries the kind and store.
+
 ## 0.2.5
 - `query`: runs one read-only GraphQL query (mutations refused) and logs the answer, for working out the site's API.
 

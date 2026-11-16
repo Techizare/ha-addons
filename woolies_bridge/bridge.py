@@ -143,7 +143,8 @@ def summarise_cart(d: dict) -> dict:
     slot, slot_info = "", None
     if isinstance(ful, dict):
         slot_info = {"id": ful.get("id") or (c.get("fulfilment") or {}).get("propositionId"), "method": ful.get("method"),
-                     "start": ful.get("startTime"), "end": ful.get("endTime"), "name": ful.get("name")}
+                     "start": ful.get("startTime"), "end": ful.get("endTime"), "name": ful.get("name"),
+                     "kind": ful.get("kind"), "store": (ful.get("store") or {}).get("name") or ""}
         slot = " ".join(str(ful.get(k)) for k in ("method", "startTime", "endTime", "description", "name") if ful.get(k))
     elif ful:
         slot = str(ful)
@@ -377,34 +378,88 @@ def slot_fee(p: dict, cart_cents) -> int | None:
     return None
 
 
-async def slots() -> dict:
+PREFS_FILE = DATA / "prefs.json"
+DEFAULT_PICKUP = {"id": "9473", "name": "Claudelands Woolworths"}  # nearest to Newstead; changeable from the card
+LOC_Q = ("query SearchLocations($input: LocationsInput!) { locations(input: $input) { locations { "
+         "id name storeId address { locality { suburb } lines { line1 } } } } }")
+
+
+def load_prefs() -> dict:
+    try:
+        return json.loads(PREFS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_prefs(d: dict) -> None:
+    PREFS_FILE.write_text(json.dumps(d, ensure_ascii=False))
+
+
+def _why(p: dict) -> str:
+    return next((t.split(":", 1)[1] for t in p.get("tags") or [] if str(t).startswith("unavailableReason:")), "")
+
+
+async def slots(method: str = "delivery", store: dict | None = None) -> dict:
+    """Delivery times for the account's saved address, or Click & collect times at a pickup store
+    (the website's own Propositions query: locationId is the address id or the store id)."""
+    prefs = load_prefs()
+    if method == "pickup":
+        if store and store.get("id"):
+            prefs["pickup_store"] = {"id": str(store["id"]), "name": str(store.get("name") or "")}
+            save_prefs(prefs)
+        st = prefs.get("pickup_store") or DEFAULT_PICKUP
     bs = BrowserSession(headless=True)
     async with bs as page:
         await page.goto("https://www.woolworths.co.nz")
         await page.wait_for_timeout(3000)
-        me = (await gql(page, "GetMeAddresses", ADDR_Q)).get("me") or {}
-        addrs = me.get("addresses") or []
-        if not addrs:
-            raise RuntimeError("No delivery address saved on the Woolworths account.")
-        a = addrs[0]
-        props = ((await gql(page, "Propositions", PROP_Q, {"input": {"locationId": a["id"]}}))
+        a = {}
+        if method == "pickup":
+            loc = st["id"]
+        else:
+            addrs = ((await gql(page, "GetMeAddresses", ADDR_Q)).get("me") or {}).get("addresses") or []
+            if not addrs:
+                raise RuntimeError("No delivery address saved on the Woolworths account.")
+            a = addrs[0]
+            loc = a["id"]
+        props = ((await gql(page, "Propositions", PROP_Q, {"input": {"locationId": loc}}))
                  .get("propositions") or {}).get("propositions") or []
     cart = load_cart().get("total_cents")
-    by = {}
-    for p in props:
-        by[(p.get("method"), p.get("kind"))] = by.get((p.get("method"), p.get("kind")), 0) + 1
-    log("slots", len(props), {f"{k[0]}/{k[1]}": v for k, v in by.items()})
-    for p in [p for p in props if p.get("method") == "delivery"][:3]:
-        log("slot sample", json.dumps(p, ensure_ascii=False)[:600])
-    # Delivery only: the account's pickup store is Woolworths' default (Birkenhead), not one near the house.
-    props = [p for p in props if p.get("method") == "delivery"]
-    out = [{"id": p.get("id"), "method": p.get("method"), "kind": p.get("kind"), "type": p.get("type"),
+    props = [p for p in props if p.get("method") == method]
+    log("slots", method, loc, len(props))
+    if method == "pickup":
+        # Each pickup time comes twice: brought to your boot (dtb-team) or you pick it up from the bay
+        # (dtb-customer). Show one per time, preferring to-the-boot when it is free.
+        by = {}
+        for p in props:
+            by.setdefault((p.get("startTime"), p.get("endTime")), []).append(p)
+        props = []
+        for k in sorted(by):
+            g = by[k]
+            props.append(next((p for p in g if p.get("available") and p.get("kind") == "dtb-team"), None)
+                         or next((p for p in g if p.get("available")), None) or g[0])
+    out = [{"id": p.get("id"), "method": p.get("method"), "kind": p.get("kind"),
             "available": bool(p.get("available")), "start": p.get("startTime"), "end": p.get("endTime"),
-            "store": (p.get("store") or {}).get("name") or "", "fee_cents": slot_fee(p, cart),
-            "why": next((t.split(":", 1)[1] for t in p.get("tags") or [] if str(t).startswith("unavailableReason:")), "")}
+            "store": (p.get("store") or {}).get("name") or "", "fee_cents": slot_fee(p, cart), "why": _why(p)}
            for p in props]
-    return {"address": ", ".join(x for x in ((a.get("lines") or {}).get("line1"), (a.get("lines") or {}).get("line2")) if x),
-            "address_id": a["id"], "slots": out}
+    res = {"method": method, "slots": out}
+    if method == "pickup":
+        res["store"] = st
+    else:
+        res["address"] = ", ".join(x for x in ((a.get("lines") or {}).get("line1"), (a.get("lines") or {}).get("line2")) if x)
+    return res
+
+
+async def stores(q: str) -> dict:
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(3000)
+        locs = ((await gql(page, "SearchLocations", LOC_Q, {"input": {"search": q or "Hamilton"}}))
+                .get("locations") or {}).get("locations") or []
+    return {"stores": [{"id": l.get("id"), "name": l.get("name"),
+                        "suburb": ((l.get("address") or {}).get("locality") or {}).get("suburb") or "",
+                        "street": ((l.get("address") or {}).get("lines") or {}).get("line1") or ""} for l in locs],
+            "current": load_prefs().get("pickup_store") or DEFAULT_PICKUP}
 
 
 SET_SLOT_Q = ("mutation SetCartFulfilment($fulfilmentPropositionId: String!) { "
@@ -537,7 +592,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "scan_js", "query"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "scan_js", "query"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -551,7 +606,9 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             elif op == "query":
                 out = await query(str(req.get("q", "")), req.get("variables") or {})
             elif op == "slots":
-                out = await slots()
+                out = await slots("pickup" if req.get("method") == "pickup" else "delivery", req.get("store"))
+            elif op == "stores":
+                out = await stores(str(req.get("q") or "Hamilton"))
             elif op == "slot_set":
                 out = await slot_set(str(req.get("slot") or ""))
             elif op == "scan_js":
