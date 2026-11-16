@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.0
+- Reads the trolley with the website's own CustomerCart query (`cart`), changes or removes lines (`cart_set`), and keeps a saved copy (`cart_get`, and the sensor's `cart` attribute) for the meal planner's trolley card. Every fill also refreshes the saved copy.
+
 ## 0.1.8
 - `capture_page` request for working out how the site reads the trolley; kilo items try SKU-KG first.
 

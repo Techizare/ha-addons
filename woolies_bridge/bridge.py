@@ -78,6 +78,7 @@ async def set_sensor(session: aiohttp.ClientSession, status: str, error: str = "
             "last_error": state["last_error"],
             "last_ok": state["last_ok"],
             "matches": len(load_map()),
+            "cart": load_cart(),
         },
     }
     try:
@@ -95,19 +96,101 @@ def friendly(e: Exception) -> str:
     return s
 
 
-def summarise_cart(cart: dict) -> dict:
+CART_FILE = DATA / "cart.json"
+
+
+def load_cart() -> dict:
+    try:
+        return json.loads(CART_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_cart(c: dict) -> None:
+    tmp = CART_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(c, ensure_ascii=False))
+    tmp.replace(CART_FILE)
+
+
+_logged_product_keys = [False]
+
+
+def summarise_cart(d: dict) -> dict:
+    """The website's own CustomerCart answer, cut down to what the trolley card shows."""
+    c = ((d or {}).get("data") or {}).get("customerCart") or {}
+    names = {str(v.get("sku")): v.get("name") for v in load_map().values() if isinstance(v, dict)}
     lines = []
-    for cat in cart.get("items", []) or []:
-        for p in cat.get("products", []) or []:
-            q = p.get("quantity", {}) or {}
-            lines.append({
-                "sku": str(p.get("sku", "")),
-                "name": p.get("name", ""),
-                "qty": q.get("quantityInOrder") or q.get("value"),
-                "unit": p.get("unit", ""),
-            })
-    totals = cart.get("subtotal") or cart.get("totals") or {}
-    return {"count": len(lines), "lines": lines, "totals": totals}
+    for li in c.get("lineItems") or []:
+        p = li.get("product") or {}
+        if not _logged_product_keys[0]:
+            _logged_product_keys[0] = True
+            log("cart product keys", sorted(p.keys()))
+        var = li.get("productVariantSku") or ""
+        sku = str(li.get("sku") or var.split("-")[0])
+        name = (p.get("name") or p.get("productName") or p.get("displayName") or p.get("title")
+                or names.get(sku) or var)
+        tot = li.get("lineTotal") or {}
+        img = p.get("imageUrl") or p.get("image") or ""
+        lines.append({"sku": sku, "variant": var, "kg": var.endswith("-KG"), "qty": li.get("quantity"),
+                      "cents": tot.get("afterDiscountAsCents"), "saved": tot.get("discountAmountAsCents") or 0,
+                      "name": name, "brand": p.get("brand") or "", "img": img if isinstance(img, str) else ""})
+    ful = (c.get("fulfilment") or {}).get("fulfilmentProposition")
+    slot = ""
+    if isinstance(ful, dict):
+        slot = " ".join(str(ful.get(k)) for k in ("method", "startTime", "endTime", "description", "name") if ful.get(k))
+    elif ful:
+        slot = str(ful)
+    issues = [v.get("message") for v in ((c.get("validationResult") or {}).get("failedValidations") or [])
+              if v.get("ruleName") != "ValidateHasFulfilmentProposition" and v.get("message")]
+    return {"lines": lines, "count": len(lines), "total_cents": (c.get("checkout") or {}).get("amountToPayAsCents"),
+            "fees": [{"type": f.get("type"), "cents": f.get("amountAsCents")} for f in c.get("fees") or []],
+            "slot": slot, "has_slot": bool(ful), "issues": issues, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+
+
+async def read_cart(page) -> dict:
+    """Open the website's trolley page and keep its own CustomerCart answer."""
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    async def on_resp(r):
+        try:
+            if r.request.headers.get("wnzx-operation-name") == "CustomerCart" and not fut.done():
+                fut.set_result(await r.json())
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+
+    page.on("response", on_resp)
+    try:
+        await page.goto("https://www.woolworths.co.nz/cart")
+        data = await asyncio.wait_for(fut, 30)
+    finally:
+        page.remove_listener("response", on_resp)
+    snap = summarise_cart(data)
+    save_cart(snap)
+    return snap
+
+
+async def cart_set(changes: list) -> dict:
+    """[{variant, qty}] sets each line's quantity (0 removes it), then reads the trolley back."""
+    failed = []
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(3000)
+        for ch in changes:
+            v = str(ch.get("variant") or "")
+            q = float(ch.get("qty") or 0)
+            if not v:
+                continue
+            q = round(q, 3) if v.endswith("-KG") else max(0, round(q))
+            res = await page.evaluate(ADD_JS, [v, q])
+            if not res.get("ok"):
+                log("cart change failed", v, q, res.get("status"), res.get("error") or res.get("text", "")[:200])
+                failed.append({"variant": v, "error": add_error(res)})
+            await asyncio.sleep(0.3)
+        snap = await read_cart(page)
+    return dict(snap, failed=failed)
 
 
 # Trolley adds run inside the signed-in browser page with the website's own GraphQL call (captured from its
@@ -168,6 +251,10 @@ async def add_items(items: list) -> dict:
                 log("add failed", it.get("name", ""), repr(e)[:200])
                 failed.append({"ref": ref, "name": it.get("name", ""), "error": friendly(e)})
             await asyncio.sleep(0.4)  # gentle on their servers
+        try:
+            await read_cart(page)
+        except Exception as e:
+            log("trolley read after add failed", repr(e)[:200])
     log("added", len(done), "failed", len(failed))
     return {"added": done, "failed": failed}
 
@@ -284,6 +371,8 @@ async def handle(session: aiohttp.ClientSession, req: dict):
     op = req.get("op")
     if op == "status":
         return {"status": state["status"], "has_credentials": bool(OPTIONS.get("username")), "last_error": state["last_error"], "matches": len(load_map())}
+    if op == "cart_get":
+        return load_cart()
     if op == "map_get":
         return load_map()
     if op == "map_set":
@@ -299,7 +388,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -320,7 +409,11 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             elif op == "search":
                 out = await client.search(str(req.get("q", "")), int(req.get("limit", 12)))
             elif op == "cart":
-                out = summarise_cart(await client.get_cart())
+                bs = BrowserSession(headless=True)
+                async with bs as page:
+                    out = await read_cart(page)
+            elif op == "cart_set":
+                out = await cart_set(req.get("changes", []) or [])
             elif op == "add":
                 # {"items": [{"sku", "qty", "unit": "Each" | "Kilogram", "name", "ref"}]}
                 out = await add_items(req.get("items", []) or [])
