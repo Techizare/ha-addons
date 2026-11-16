@@ -208,6 +208,47 @@ async def diag() -> dict:
     return d
 
 
+async def capture(key: str) -> dict:
+    """Add one remembered product to the trolley through the website's own button and log the API calls it makes,
+    so the add-on can make the same call. Logs operation names, request bodies and response codes (no cookies)."""
+    m = load_map().get(key.strip().lower()) or {}
+    sku = str(m.get("sku") or "")
+    if not sku:
+        raise ValueError(f"No remembered product for '{key}'")
+    bs = BrowserSession(headless=True)
+    calls = []
+
+    def on_req(r):
+        if "/api/" in r.url and r.method != "GET" and len(calls) < 20:
+            calls.append(r)
+
+    async with bs as page:
+        await page.goto(f"https://www.woolworths.co.nz/shop/productdetails?stockcode={sku}")
+        await page.wait_for_timeout(6000)
+        page.on("request", on_req)
+        btns = await page.evaluate("""() => [...document.querySelectorAll('button')]
+            .filter((b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+            .map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 60))
+            .filter((t) => /add|trolley|cart|quantity|increase/i.test(t))""")
+        log("capture", sku, "buttons", json.dumps(btns, ensure_ascii=False)[:800])
+        loc = page.locator("button", has_text="Add").first
+        try:
+            await loc.click(timeout=8000)
+        except Exception as e:
+            log("capture click failed", repr(e)[:300])
+        await page.wait_for_timeout(5000)
+        out = []
+        for r in calls:
+            resp = await r.response()
+            body = r.post_data or ""
+            out.append({"url": r.url.split("?")[0], "op": r.headers.get("wnzx-operation-name"),
+                        "status": resp.status if resp else None, "body": body[:1500],
+                        "resp": ((await resp.text()) if resp else "")[:500]})
+    for c in out:
+        log("capture call", json.dumps(c, ensure_ascii=False)[:2600])
+    return {"sku": sku, "buttons": btns, "calls": out}
+
+
 async def handle(session: aiohttp.ClientSession, req: dict):
     op = req.get("op")
     if op == "status":

@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.6
+- Fix: 0.1.5 shipped without the capture code.
+
 ## 0.1.5
 - `capture` request: adds one remembered product with the website's own button and logs the API call it makes (Woolworths moved to a GraphQL API).
 
