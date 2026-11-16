@@ -192,12 +192,21 @@ async def main():
 
                     async def run(req):
                         rid = req.get("id")
+                        # From script.woolies_request (non-admins, PIN checked there): the request sits under "req",
+                        # and the script only starts listening for the answer after it fires, so don't answer instantly.
+                        relayed = isinstance(req.get("req"), dict)
+                        if relayed:
+                            req = {**req["req"], "id": rid, "op": req.get("op")}
                         log("request", req.get("op"), rid)
                         try:
                             data = await handle(session, req)
+                            if relayed:
+                                await asyncio.sleep(0.3)
                             await reply(rid, {"ok": True, "data": data})
                         except Exception as e:
                             log("failed", req.get("op"), e)
+                            if relayed:
+                                await asyncio.sleep(0.3)
                             await reply(rid, {"ok": False, "error": str(e)})
 
                     async for msg in ws:

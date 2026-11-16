@@ -16,12 +16,15 @@ account, and a change to their site can stop it working until the tool is update
 4. Check the **Log** tab shows `Listening for woolies_request events`.
 
 `sensor.woolies_bridge` then appears. While it exists, the shopping list shows a 🛒 Trolley button
-to Home Assistant admins.
+to everyone. Admins use it straight away; other logins enter a household PIN first (needs
+`script.woolies_request`, see below).
 
 ## How it works
 
 - The card asks for things by firing a `woolies_request` event, and the add-on answers with a
-  `woolies_result` event. Only admins can fire and listen to these events.
+  `woolies_result` event. Only admins can fire and listen to these events, so for other logins the card
+  calls `script.woolies_request` instead. That script checks a household PIN (`input_text.pin_<name>`),
+  fires the event for them, waits for the answer and returns it as the script's response.
 - The browser is used only to sign in, or to sign in again when the session expires (every few
   weeks). Searches and trolley changes are quick web requests.
 - Your email, password, sign-in cookies and the products you picked for each list item stay in
