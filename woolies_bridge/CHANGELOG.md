@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.8
+- `capture_page` request for working out how the site reads the trolley; kilo items try SKU-KG first.
+
 ## 0.1.7
 - Trolley adds use the website's current GraphQL call (SetCartLineItemQuantity). The old REST trolley API now answers 401, which is why every add was refused.
 

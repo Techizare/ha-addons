@@ -148,8 +148,8 @@ async def add_items(items: list) -> dict:
             sku = str(it["sku"])
             qty = float(it.get("qty") or 1)
             by_kg = (it.get("unit") or "Each") in ("Kilogram", "Kg")
-            # Loose produce sold by weight: the kilo variant key isn't captured yet, so try the likely two and log which works.
-            tries = [(f"{sku}-KGM", round(qty, 3)), (f"{sku}-KG", round(qty, 3))] if by_kg else \
+            # Loose produce sold by weight: the kilo variant key is SKU-KG (seen working 2026-11-16).
+            tries = [(f"{sku}-KG", round(qty, 3)), (f"{sku}-KGM", round(qty, 3))] if by_kg else \
                 [(f"{sku}-EA", max(1, round(qty)))]
             try:
                 res = {}
@@ -205,6 +205,38 @@ async def diag() -> dict:
     for k in ("url", "title", "links", "cookies", "all_cookies", "api"):
         log("diag", k, json.dumps(d.get(k), ensure_ascii=False)[:1500])
     return d
+
+
+async def capture_page(url: str, click: str = "") -> dict:
+    """Open a Woolworths page (optionally click a button/link by text) and log the GraphQL calls it makes:
+    operation name, request body and the start of the answer. For working out the site's API. No cookies logged."""
+    bs = BrowserSession(headless=True)
+    calls = []
+
+    def on_req(r):
+        if "/api/" in r.url and len(calls) < 30:
+            calls.append(r)
+
+    async with bs as page:
+        page.on("request", on_req)
+        await page.goto(url or "https://www.woolworths.co.nz")
+        await page.wait_for_timeout(6000)
+        if click:
+            try:
+                await page.get_by_text(click, exact=False).first.click(timeout=8000)
+                await page.wait_for_timeout(6000)
+            except Exception as e:
+                log("capture_page click failed", repr(e)[:300])
+        log("capture_page at", page.url)
+        out = []
+        for r in calls:
+            resp = await r.response()
+            out.append({"op": r.headers.get("wnzx-operation-name") or r.url.split("?")[0][-50:],
+                        "status": resp.status if resp else None, "body": (r.post_data or "")[:1200],
+                        "resp": ((await resp.text()) if resp else "")[:1500]})
+    for c in out:
+        log("capture_page call", json.dumps(c, ensure_ascii=False)[:3000])
+    return {"url": url, "calls": [c["op"] for c in out]}
 
 
 async def capture(key: str) -> dict:
@@ -267,13 +299,15 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
         try:
             if op == "diag":
                 out = await diag()
+            elif op == "capture_page":
+                out = await capture_page(str(req.get("url", "")), str(req.get("click", "")))
             elif op == "capture":
                 out = await capture(str(req.get("key", "")))
             elif op == "login":
