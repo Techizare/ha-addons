@@ -29,7 +29,7 @@ to everyone. Admins use it straight away; other logins enter a household PIN fir
   weeks). Searches and trolley changes are quick web requests.
 - Your email, password, sign-in cookies and the products you picked for each list item stay in
   this add-on's storage on your Home Assistant box. Nothing is sent anywhere except woolworths.co.nz.
-- It adds items to the trolley only. You book the time slot and check out in the Woolworths app.
+- It fills the trolley and books a delivery slot (from the trolley card). You check out and pay in the Woolworths app.
 
 ## Sensor states
 

@@ -140,8 +140,10 @@ def summarise_cart(d: dict) -> dict:
                       "cents": tot.get("afterDiscountAsCents"), "saved": tot.get("discountAmountAsCents") or 0,
                       "name": name, "brand": p.get("brand") or "", "img": img if isinstance(img, str) else ""})
     ful = (c.get("fulfilment") or {}).get("fulfilmentProposition")
-    slot = ""
+    slot, slot_info = "", None
     if isinstance(ful, dict):
+        slot_info = {"id": ful.get("id") or (c.get("fulfilment") or {}).get("propositionId"), "method": ful.get("method"),
+                     "start": ful.get("startTime"), "end": ful.get("endTime"), "name": ful.get("name")}
         slot = " ".join(str(ful.get(k)) for k in ("method", "startTime", "endTime", "description", "name") if ful.get(k))
     elif ful:
         slot = str(ful)
@@ -149,7 +151,7 @@ def summarise_cart(d: dict) -> dict:
               if v.get("ruleName") != "ValidateHasFulfilmentProposition" and v.get("message")]
     return {"lines": lines, "count": len(lines), "total_cents": (c.get("checkout") or {}).get("amountToPayAsCents"),
             "fees": [{"type": f.get("type"), "cents": f.get("amountAsCents")} for f in c.get("fees") or []],
-            "slot": slot, "has_slot": bool(ful), "issues": issues, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+            "slot": slot, "slot_info": slot_info, "has_slot": bool(ful), "issues": issues, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
 
 async def read_cart(page) -> dict:
@@ -392,6 +394,10 @@ async def slots() -> dict:
     for p in props:
         by[(p.get("method"), p.get("kind"))] = by.get((p.get("method"), p.get("kind")), 0) + 1
     log("slots", len(props), {f"{k[0]}/{k[1]}": v for k, v in by.items()})
+    for p in [p for p in props if p.get("method") == "delivery"][:3]:
+        log("slot sample", json.dumps(p, ensure_ascii=False)[:600])
+    # Delivery only: the account's pickup store is Woolworths' default (Birkenhead), not one near the house.
+    props = [p for p in props if p.get("method") == "delivery"]
     out = [{"id": p.get("id"), "method": p.get("method"), "kind": p.get("kind"), "type": p.get("type"),
             "available": bool(p.get("available")), "start": p.get("startTime"), "end": p.get("endTime"),
             "store": (p.get("store") or {}).get("name") or "", "fee_cents": slot_fee(p, cart),
@@ -399,6 +405,32 @@ async def slots() -> dict:
            for p in props]
     return {"address": ", ".join(x for x in ((a.get("lines") or {}).get("line1"), (a.get("lines") or {}).get("line2")) if x),
             "address_id": a["id"], "slots": out}
+
+
+SET_SLOT_Q = ("mutation SetCartFulfilment($fulfilmentPropositionId: String!) { "
+              "setCartFulfilment(fulfilmentPropositionId: $fulfilmentPropositionId) { "
+              "fulfilment { propositionId } validationResult { isValid failedValidations { ruleName message } } } }")
+CLEAR_SLOT_Q = "mutation ClearCartFulfilment { clearCartFulfilment { fulfilment { propositionId } } }"
+
+
+async def slot_set(pid: str) -> dict:
+    """Book (reserve) a slot on the trolley with the website's own SetCartFulfilment call, or with an empty id
+    let it go (ClearCartFulfilment). Then read the trolley back so the card shows the slot."""
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(3000)
+        if pid:
+            d = (await gql(page, "SetCartFulfilment", SET_SLOT_Q, {"fulfilmentPropositionId": pid})).get("setCartFulfilment") or {}
+            got = (d.get("fulfilment") or {}).get("propositionId")
+            log("slot set", pid, "->", got)
+            if got != pid:
+                raise RuntimeError("Woolworths didn't keep that slot. It may have just filled up: try another.")
+        else:
+            await gql(page, "ClearCartFulfilment", CLEAR_SLOT_Q)
+            log("slot cleared")
+        snap = await read_cart(page)
+    return snap
 
 
 async def scan_js(terms: list) -> dict:
@@ -487,7 +519,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "scan_js"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "scan_js"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -500,6 +532,8 @@ async def handle(session: aiohttp.ClientSession, req: dict):
                 out = await capture(str(req.get("key", "")))
             elif op == "slots":
                 out = await slots()
+            elif op == "slot_set":
+                out = await slot_set(str(req.get("slot") or ""))
             elif op == "scan_js":
                 out = await scan_js([str(t) for t in (req.get("terms") or [])][:6])
             elif op == "login":

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+- `slot_set`: books a delivery slot on the trolley (the website's own SetCartFulfilment call); an empty slot lets it go.
+- `slots` lists delivery slots only. The trolley snapshot gains `slot_info` (id, method, start, end).
+
 ## 0.2.3
 - `slots`: the delivery and pickup slots Woolworths offers for the account's saved address (the website's own Propositions query).
 - `scan_js`: searches the website's JavaScript for named GraphQL operations, for working out the slot booking call.
