@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.5
+- `capture` request: adds one remembered product with the website's own button and logs the API call it makes (Woolworths moved to a GraphQL API).
+
 ## 0.1.4
 - `diag` also lists the headers the website itself sends on its API calls (names only) and all cookie names.
 

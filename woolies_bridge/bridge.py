@@ -227,13 +227,15 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
         try:
             if op == "diag":
                 out = await diag()
+            elif op == "capture":
+                out = await capture(str(req.get("key", "")))
             elif op == "login":
                 bs = BrowserSession(headless=True)
                 async with bs as page:
