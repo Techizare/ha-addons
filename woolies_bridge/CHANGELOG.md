@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.5
+- `query`: runs one read-only GraphQL query (mutations refused) and logs the answer, for working out the site's API.
+
 ## 0.2.4
 - `slot_set`: books a delivery slot on the trolley (the website's own SetCartFulfilment call); an empty slot lets it go.
 - `slots` lists delivery slots only. The trolley snapshot gains `slot_info` (id, method, start, end).

@@ -433,6 +433,24 @@ async def slot_set(pid: str) -> dict:
     return snap
 
 
+async def query(q: str, variables: dict) -> dict:
+    """Run one read-only GraphQL query in the signed-in page and log the answer (for working out the site's API).
+    Mutations are refused, so this can't change the trolley or the account."""
+    q = q.strip()
+    if not q.startswith("query"):
+        raise ValueError("Only queries are allowed here")
+    name = (re.match(r"query\s+([A-Za-z0-9_]+)", q) or [None, "Query"])[1]
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(3000)
+        res = await page.evaluate(GQL_JS, [name, q, variables or {}])
+    txt = json.dumps(res.get("json") or res.get("text"), ensure_ascii=False)
+    for i in range(0, min(len(txt), 12000), 2500):
+        log("query", name, i, txt[i:i + 2500])
+    return {"status": res.get("status"), "size": len(txt)}
+
+
 async def scan_js(terms: list) -> dict:
     """Search the website's own JavaScript for GraphQL operations (e.g. the slot booking mutation) and log
     each match with some text either side. Read-only: nothing is clicked or sent."""
@@ -519,7 +537,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "scan_js"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "scan_js", "query"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -530,6 +548,8 @@ async def handle(session: aiohttp.ClientSession, req: dict):
                 out = await capture_page(str(req.get("url", "")), str(req.get("click", "")))
             elif op == "capture":
                 out = await capture(str(req.get("key", "")))
+            elif op == "query":
+                out = await query(str(req.get("q", "")), req.get("variables") or {})
             elif op == "slots":
                 out = await slots()
             elif op == "slot_set":
