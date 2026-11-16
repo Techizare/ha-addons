@@ -288,12 +288,16 @@ async def diag() -> dict:
 
     async with bs as page:
         page.on("request", on_req)
-        await page.goto("https://www.woolworths.co.nz")
+        resp = await page.goto("https://www.woolworths.co.nz")
         await page.wait_for_timeout(6000)
         d = await page.evaluate(DIAG_JS)
+        hd = (await resp.all_headers()) if resp else {}
+        d["frame"] = {"x-frame-options": hd.get("x-frame-options"),
+                      "frame-ancestors": [p.strip() for p in (hd.get("content-security-policy") or "").split(";")
+                                          if p.strip().startswith("frame-ancestors")]}
         d["all_cookies"] = sorted({c["name"] for c in await page.context.cookies()})
         d["api"] = seen
-    for k in ("url", "title", "links", "cookies", "all_cookies", "api"):
+    for k in ("url", "title", "links", "cookies", "all_cookies", "api", "frame"):
         log("diag", k, json.dumps(d.get(k), ensure_ascii=False)[:1500])
     return d
 

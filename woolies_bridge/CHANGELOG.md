@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.2
+- `diag` also logs whether the site allows being shown inside another page (X-Frame-Options / frame-ancestors).
+
 ## 0.2.1
 - Trolley lines use the product's proper name (and picture, when the site gives one).
 
