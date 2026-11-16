@@ -110,6 +110,69 @@ def summarise_cart(cart: dict) -> dict:
     return {"count": len(lines), "lines": lines, "totals": totals}
 
 
+# Trolley adds run inside the signed-in browser page, the way the website itself does them. Woolworths refuses
+# the same POST from the plain HTTP client (0.1.0 then re-signed in for every item, about a minute each).
+ADD_JS = """async ([sku, qty, unit]) => {
+  const m = document.cookie.match(/(?:^|; )XSRF-TOKEN=([^;]+)/);
+  const h = {"content-type": "application/json", "accept": "application/json, text/plain, */*",
+             "x-requested-with": "OnlineShopping.WebApp"};
+  if (m) h["x-xsrf-token"] = decodeURIComponent(m[1]);
+  const r = await fetch("/api/v1/trolleys/my/items", {method: "POST", credentials: "include", headers: h,
+    body: JSON.stringify({sku: sku, quantity: String(qty), pricingUnit: unit})});
+  let t = ""; try { t = await r.text(); } catch (e) {}
+  return {status: r.status, xsrf: !!m, text: t.slice(0, 400)};
+}"""
+
+
+def add_error(res: dict) -> str:
+    st, txt = res.get("status"), res.get("text") or ""
+    try:
+        msg = json.loads(txt).get("message") or ""
+    except Exception:
+        msg = ""
+    if st in (401, 403):
+        return f"Woolworths refused the add ({st}). The Woolies Bridge log has the details."
+    return msg or f"Woolworths error {st}: {txt[:120]}"
+
+
+async def add_items(items: list) -> dict:
+    done, failed = [], []
+    if not items:
+        return {"added": done, "failed": failed}
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await bs.ensure_logged_in(page)
+        await page.wait_for_timeout(1500)
+        relogged = False
+        for it in items:
+            ref = it.get("ref") or it.get("sku")
+            unit = "Kg" if (it.get("unit") or "Each") in ("Kilogram", "Kg") else "Each"
+            qty = float(it.get("qty") or 1)
+            if unit == "Each":
+                qty = max(1, round(qty))
+            try:
+                res = await page.evaluate(ADD_JS, [str(it["sku"]), qty, unit])
+                if res.get("status") in (401, 403) and not relogged:
+                    log("add refused", res.get("status"), "xsrf" if res.get("xsrf") else "no xsrf", "- signing in again")
+                    relogged = True
+                    await bs.login(page)
+                    await page.goto("https://www.woolworths.co.nz")
+                    await page.wait_for_timeout(2500)
+                    res = await page.evaluate(ADD_JS, [str(it["sku"]), qty, unit])
+                if 200 <= (res.get("status") or 0) < 300:
+                    done.append(ref)
+                else:
+                    err = add_error(res)
+                    log("add failed", it.get("name", ""), res.get("status"), (res.get("text") or "")[:200])
+                    failed.append({"ref": ref, "name": it.get("name", ""), "error": err})
+            except Exception as e:  # one product shouldn't stop the rest
+                log("add failed", it.get("name", ""), repr(e)[:200])
+                failed.append({"ref": ref, "name": it.get("name", ""), "error": friendly(e)})
+            await asyncio.sleep(0.4)  # gentle on their servers
+    log("added", len(done), "failed", len(failed))
+    return {"added": done, "failed": failed}
+
+
 async def handle(session: aiohttp.ClientSession, req: dict):
     op = req.get("op")
     if op == "status":
@@ -146,16 +209,8 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             elif op == "cart":
                 out = summarise_cart(await client.get_cart())
             elif op == "add":
-                # {"items": [{"sku", "qty", "unit": "Each" | "Kilogram", "name"}]}: one at a time, carrying on past a failure.
-                done, failed = [], []
-                for it in req.get("items", []) or []:
-                    try:
-                        await client.add_to_cart(str(it["sku"]), float(it["qty"]), it.get("unit") or "Each")
-                        done.append(it.get("ref") or it["sku"])
-                    except Exception as e:  # one product out of stock shouldn't stop the rest
-                        failed.append({"ref": it.get("ref") or it.get("sku"), "name": it.get("name", ""), "error": friendly(e)})
-                    await asyncio.sleep(0.4)  # gentle on their servers
-                out = {"added": done, "failed": failed}
+                # {"items": [{"sku", "qty", "unit": "Each" | "Kilogram", "name", "ref"}]}
+                out = await add_items(req.get("items", []) or [])
             else:
                 raise ValueError(f"Unknown request: {op}")
             await set_sensor(session, "ready")
