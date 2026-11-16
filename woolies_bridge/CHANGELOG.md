@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3
+- `slots`: the delivery and pickup slots Woolworths offers for the account's saved address (the website's own Propositions query).
+- `scan_js`: searches the website's JavaScript for named GraphQL operations, for working out the slot booking call.
+
 ## 0.2.2
 - `diag` also logs whether the site allows being shown inside another page (X-Frame-Options / frame-ancestors).
 

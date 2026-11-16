@@ -15,6 +15,7 @@ Configuration tab, and the sign-in cookies and the remembered product matches li
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -334,6 +335,96 @@ async def capture_page(url: str, click: str = "") -> dict:
     return {"url": url, "calls": [c["op"] for c in out]}
 
 
+# Delivery and pickup slots: the website's own Propositions query (captured from its slot picker, Nov 2026),
+# asked for the account's first saved address.
+GQL_JS = """async ([op, query, variables]) => {
+  const r = await fetch("/api/graphql", {method: "POST", credentials: "include",
+    headers: {"content-type": "application/json", "accept": "*/*", "wnzx-operation-name": op},
+    body: JSON.stringify({operationName: op, query: query, variables: variables || {}})});
+  let t = ""; try { t = await r.text(); } catch (e) {}
+  let j = null; try { j = JSON.parse(t); } catch (e) {}
+  return {status: r.status, json: j, text: j ? "" : t.slice(0, 300)};
+}"""
+
+ADDR_Q = "query GetMeAddresses { me { id addresses { id lines { line1 line2 } } } }"
+PROP_Q = ("query Propositions($input: PropositionsInput!) { propositions(input: $input) { propositions { "
+          "store { storeId name } id storeId name method type kind available startTime endTime "
+          "fees { type amountInCents rateCard { orderValueMinInCents orderValueMaxInCents amountInCents } } tags } } }")
+
+
+async def gql(page, op: str, query: str, variables: dict | None = None) -> dict:
+    res = await page.evaluate(GQL_JS, [op, query, variables or {}])
+    j = res.get("json") or {}
+    if res.get("status") in (401, 403):
+        raise RuntimeError(f"Woolworths refused {op} ({res.get('status')}): the add-on isn't signed in.")
+    if j.get("errors"):
+        raise RuntimeError(f"Woolworths {op}: " + "; ".join(str(e.get("message")) for e in j["errors"])[:300])
+    if not j.get("data"):
+        raise RuntimeError(f"Woolworths {op} error {res.get('status')}: {res.get('text', '')[:150]}")
+    return j["data"]
+
+
+def slot_fee(p: dict, cart_cents) -> int | None:
+    for f in p.get("fees") or []:
+        if f.get("amountInCents") is not None:
+            return f["amountInCents"]
+        for rc in f.get("rateCard") or []:
+            lo, hi = rc.get("orderValueMinInCents") or 0, rc.get("orderValueMaxInCents")
+            if cart_cents is None or (cart_cents >= lo and (hi is None or cart_cents <= hi)):
+                return rc.get("amountInCents")
+    return None
+
+
+async def slots() -> dict:
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(3000)
+        me = (await gql(page, "GetMeAddresses", ADDR_Q)).get("me") or {}
+        addrs = me.get("addresses") or []
+        if not addrs:
+            raise RuntimeError("No delivery address saved on the Woolworths account.")
+        a = addrs[0]
+        props = ((await gql(page, "Propositions", PROP_Q, {"input": {"locationId": a["id"]}}))
+                 .get("propositions") or {}).get("propositions") or []
+    cart = load_cart().get("total_cents")
+    by = {}
+    for p in props:
+        by[(p.get("method"), p.get("kind"))] = by.get((p.get("method"), p.get("kind")), 0) + 1
+    log("slots", len(props), {f"{k[0]}/{k[1]}": v for k, v in by.items()})
+    out = [{"id": p.get("id"), "method": p.get("method"), "kind": p.get("kind"), "type": p.get("type"),
+            "available": bool(p.get("available")), "start": p.get("startTime"), "end": p.get("endTime"),
+            "store": (p.get("store") or {}).get("name") or "", "fee_cents": slot_fee(p, cart),
+            "why": next((t.split(":", 1)[1] for t in p.get("tags") or [] if str(t).startswith("unavailableReason:")), "")}
+           for p in props]
+    return {"address": ", ".join(x for x in ((a.get("lines") or {}).get("line1"), (a.get("lines") or {}).get("line2")) if x),
+            "address_id": a["id"], "slots": out}
+
+
+async def scan_js(terms: list) -> dict:
+    """Search the website's own JavaScript for GraphQL operations (e.g. the slot booking mutation) and log
+    each match with some text either side. Read-only: nothing is clicked or sent."""
+    bs = BrowserSession(headless=True)
+    found = {}
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(6000)
+        urls = await page.evaluate("""() => [...new Set([...document.scripts].map(s => s.src)
+            .concat(performance.getEntriesByType('resource').map(e => e.name)).filter(u => /\\.js(\\?|$)/.test(u)))]""")
+        log("scan_js scripts", len(urls))
+        for u in urls:
+            try:
+                txt = await page.evaluate("async (u) => { const r = await fetch(u); return await r.text(); }", u)
+            except Exception:
+                continue
+            for t in terms:
+                for m in re.finditer(t, txt):
+                    found[t] = found.get(t, 0) + 1
+                    if found[t] <= 12:
+                        log("scan_js", t, u.split("/")[-1][:60], txt[max(0, m.start() - 300): m.end() + 900])
+    return {"scripts": len(urls), "found": found}
+
+
 async def capture(key: str) -> dict:
     """Add one remembered product to the trolley through the website's own button and log the API calls it makes,
     so the add-on can make the same call. Logs operation names, request bodies and response codes (no cookies)."""
@@ -396,7 +487,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "scan_js"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -407,6 +498,10 @@ async def handle(session: aiohttp.ClientSession, req: dict):
                 out = await capture_page(str(req.get("url", "")), str(req.get("click", "")))
             elif op == "capture":
                 out = await capture(str(req.get("key", "")))
+            elif op == "slots":
+                out = await slots()
+            elif op == "scan_js":
+                out = await scan_js([str(t) for t in (req.get("terms") or [])][:6])
             elif op == "login":
                 bs = BrowserSession(headless=True)
                 async with bs as page:
