@@ -1,5 +1,5 @@
 name: Woolies Bridge
-version: "0.2.6"
+version: "0.2.7"
 slug: woolies_bridge
 description: Fills your Woolworths NZ online trolley from the Home Assistant shopping list (unofficial).
 url: https://github.com/Techizare/ha-addons/tree/main/woolies_bridge

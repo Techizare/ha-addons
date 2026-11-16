@@ -80,6 +80,7 @@ async def set_sensor(session: aiohttp.ClientSession, status: str, error: str = "
             "last_ok": state["last_ok"],
             "matches": len(load_map()),
             "cart": load_cart(),
+            "orders": load_orders(),
         },
     }
     try:
@@ -485,6 +486,8 @@ async def slot_set(pid: str) -> dict:
             await gql(page, "ClearCartFulfilment", CLEAR_SLOT_Q)
             log("slot cleared")
         snap = await read_cart(page)
+    if pid and snap.get("slot_info"):
+        prefs = load_prefs(); prefs["last_slot"] = snap["slot_info"]; save_prefs(prefs)
     return snap
 
 
@@ -504,6 +507,45 @@ async def query(q: str, variables: dict) -> dict:
     for i in range(0, min(len(txt), 12000), 2500):
         log("query", name, i, txt[i:i + 2500])
     return {"status": res.get("status"), "size": len(txt)}
+
+
+ORDERS_FILE = DATA / "orders.json"
+ORDERS_Q = ("query Orders($input: OrdersInput!) { orders(input: $input) { totalCount results { orderNumber "
+            "createdDateTime orderStatus fulfilmentStatus fulfilments { method startTime endTime fulfilmentLocation { name } } "
+            "total { afterDiscountInCents } isAmendable } } }")
+
+
+def load_orders() -> list:
+    try:
+        return json.loads(ORDERS_FILE.read_text())
+    except Exception:
+        return []
+
+
+async def orders() -> list:
+    """Active (placed, not yet delivered) orders, for the Calendar / Highlights. Pickup orders don't say which store,
+    so the store comes from the slot booked on the card, or the remembered pickup store."""
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(3000)
+        res = ((await gql(page, "Orders", ORDERS_Q, {"input": {"pageIndex": 0, "pageSize": 10, "inclusiveFilter": "ACTIVE"}}))
+               .get("orders") or {}).get("results") or []
+    prefs = load_prefs()
+    last = prefs.get("last_slot") or {}
+    out = []
+    for o in res:
+        f = (o.get("fulfilments") or [{}])[0] or {}
+        store = (f.get("fulfilmentLocation") or {}).get("name") or ""
+        if f.get("method") == "pickup" and not store:
+            store = last.get("store") if last.get("start") == f.get("startTime") and last.get("store") else \
+                (prefs.get("pickup_store") or DEFAULT_PICKUP).get("name", "")
+        out.append({"number": o.get("orderNumber"), "status": o.get("orderStatus"), "method": f.get("method"),
+                    "start": f.get("startTime"), "end": f.get("endTime"), "store": store,
+                    "total_cents": (o.get("total") or {}).get("afterDiscountInCents"), "amendable": bool(o.get("isAmendable"))})
+    ORDERS_FILE.write_text(json.dumps(out, ensure_ascii=False))
+    log("orders", json.dumps(out, ensure_ascii=False)[:600])
+    return out
 
 
 async def scan_js(terms: list) -> dict:
@@ -592,7 +634,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "scan_js", "query"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -607,6 +649,8 @@ async def handle(session: aiohttp.ClientSession, req: dict):
                 out = await query(str(req.get("q", "")), req.get("variables") or {})
             elif op == "slots":
                 out = await slots("pickup" if req.get("method") == "pickup" else "delivery", req.get("store"))
+            elif op == "orders":
+                out = {"orders": await orders()}
             elif op == "stores":
                 out = await stores(str(req.get("q") or "Hamilton"))
             elif op == "slot_set":

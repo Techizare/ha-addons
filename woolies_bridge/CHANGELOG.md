@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.7
+- `orders`: placed orders that haven't arrived yet (number, delivery or pickup, time, store, total), kept on the sensor as `orders` so Home Assistant can put them on the Calendar.
+
 ## 0.2.6
 - Click & collect: `slots` with `method: pickup` lists pickup times at the chosen store (remembered; Claudelands to start), one per time, preferring to-the-boot. `stores` searches Woolworths stores by name.
 - The trolley snapshot's `slot_info` also carries the kind and store.
