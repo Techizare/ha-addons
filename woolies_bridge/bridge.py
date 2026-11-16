@@ -110,29 +110,29 @@ def summarise_cart(cart: dict) -> dict:
     return {"count": len(lines), "lines": lines, "totals": totals}
 
 
-# Trolley adds run inside the signed-in browser page, the way the website itself does them. Woolworths refuses
-# the same POST from the plain HTTP client (0.1.0 then re-signed in for every item, about a minute each).
-ADD_JS = """async ([sku, qty, unit]) => {
-  const m = document.cookie.match(/(?:^|; )XSRF-TOKEN=([^;]+)/);
-  const h = {"content-type": "application/json", "accept": "application/json, text/plain, */*",
-             "x-requested-with": "OnlineShopping.WebApp"};
-  if (m) h["x-xsrf-token"] = decodeURIComponent(m[1]);
-  const r = await fetch("/api/v1/trolleys/my/items", {method: "POST", credentials: "include", headers: h,
-    body: JSON.stringify({sku: sku, quantity: String(qty), pricingUnit: unit})});
+# Trolley adds run inside the signed-in browser page with the website's own GraphQL call (captured from its
+# "Add to cart" button, Nov 2026). The old REST trolley API the woolies-nz-cli library uses now answers 401.
+# The call SETS the line's quantity, so repeating it never doubles anything.
+ADD_JS = """async ([variant, qty]) => {
+  const q = "mutation SetCartLineItemQuantity($input: SetCartLineItemQuantitiesInput!) {\\n" +
+    "  setCartLineItemQuantity(input: $input) { key totalItemQuantity totalUniqueProductSku }\\n}";
+  const r = await fetch("/api/graphql", {method: "POST", credentials: "include",
+    headers: {"content-type": "application/json", "accept": "*/*", "wnzx-operation-name": "SetCartLineItemQuantity"},
+    body: JSON.stringify({operationName: "SetCartLineItemQuantity", query: q,
+      variables: {input: {cartLineItemQuantityUpdates: [{variantKey: variant, quantity: qty}]}}})});
   let t = ""; try { t = await r.text(); } catch (e) {}
-  return {status: r.status, xsrf: !!m, text: t.slice(0, 400)};
+  let ok = false, err = "";
+  try { const j = JSON.parse(t); ok = !!(j.data && j.data.setCartLineItemQuantity) && !(j.errors && j.errors.length);
+        if (j.errors && j.errors.length) err = j.errors.map((e) => e.message).join("; "); } catch (e) {}
+  return {status: r.status, ok: ok, error: err, text: t.slice(0, 300)};
 }"""
 
 
 def add_error(res: dict) -> str:
-    st, txt = res.get("status"), res.get("text") or ""
-    try:
-        msg = json.loads(txt).get("message") or ""
-    except Exception:
-        msg = ""
+    st = res.get("status")
     if st in (401, 403):
-        return f"Woolworths refused the add ({st}). The Woolies Bridge log has the details."
-    return msg or f"Woolworths error {st}: {txt[:120]}"
+        return f"Woolworths refused the add ({st}): the add-on isn't signed in."
+    return res.get("error") or f"Woolworths error {st}: {(res.get('text') or '')[:120]}"
 
 
 async def add_items(items: list) -> dict:
@@ -141,30 +141,29 @@ async def add_items(items: list) -> dict:
         return {"added": done, "failed": failed}
     bs = BrowserSession(headless=True)
     async with bs as page:
-        await bs.ensure_logged_in(page)
-        await page.wait_for_timeout(1500)
-        relogged = False
+        await page.goto("https://www.woolworths.co.nz")
+        await page.wait_for_timeout(4000)
         for it in items:
             ref = it.get("ref") or it.get("sku")
-            unit = "Kg" if (it.get("unit") or "Each") in ("Kilogram", "Kg") else "Each"
+            sku = str(it["sku"])
             qty = float(it.get("qty") or 1)
-            if unit == "Each":
-                qty = max(1, round(qty))
+            by_kg = (it.get("unit") or "Each") in ("Kilogram", "Kg")
+            # Loose produce sold by weight: the kilo variant key isn't captured yet, so try the likely two and log which works.
+            tries = [(f"{sku}-KGM", round(qty, 3)), (f"{sku}-KG", round(qty, 3))] if by_kg else \
+                [(f"{sku}-EA", max(1, round(qty)))]
             try:
-                res = await page.evaluate(ADD_JS, [str(it["sku"]), qty, unit])
-                if res.get("status") in (401, 403) and not relogged:
-                    log("add refused", res.get("status"), "xsrf" if res.get("xsrf") else "no xsrf", "- signing in again")
-                    relogged = True
-                    await bs.login(page)
-                    await page.goto("https://www.woolworths.co.nz")
-                    await page.wait_for_timeout(2500)
-                    res = await page.evaluate(ADD_JS, [str(it["sku"]), qty, unit])
-                if 200 <= (res.get("status") or 0) < 300:
+                res = {}
+                for variant, q in tries:
+                    res = await page.evaluate(ADD_JS, [variant, q])
+                    if res.get("ok"):
+                        if by_kg:
+                            log("added by", variant, q)
+                        break
+                if res.get("ok"):
                     done.append(ref)
                 else:
-                    err = add_error(res)
-                    log("add failed", it.get("name", ""), res.get("status"), (res.get("text") or "")[:200])
-                    failed.append({"ref": ref, "name": it.get("name", ""), "error": err})
+                    log("add failed", it.get("name", ""), res.get("status"), res.get("error") or res.get("text", "")[:200])
+                    failed.append({"ref": ref, "name": it.get("name", ""), "error": add_error(res)})
             except Exception as e:  # one product shouldn't stop the rest
                 log("add failed", it.get("name", ""), repr(e)[:200])
                 failed.append({"ref": ref, "name": it.get("name", ""), "error": friendly(e)})

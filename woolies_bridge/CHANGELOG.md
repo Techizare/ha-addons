@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.7
+- Trolley adds use the website's current GraphQL call (SetCartLineItemQuantity). The old REST trolley API now answers 401, which is why every add was refused.
+
 ## 0.1.6
 - Fix: 0.1.5 shipped without the capture code.
 
