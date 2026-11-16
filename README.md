@@ -1,6 +1,6 @@
 # Techizare Home Assistant add-ons
 
-Add this repository in Home Assistant: **Settings → Add-ons → Add-on store → ⋮ → Repositories**, paste
+Add this repository in Home Assistant: **Settings → Apps → Install app → ⋮ → Repositories** (add-ons are called apps since HA 2026.11), paste
 `https://github.com/Techizare/ha-addons`, then install the add-on below.
 
 | Add-on | What it does |
