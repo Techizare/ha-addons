@@ -50,17 +50,26 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def load_map() -> dict:
+SHOPS = ("woolworths", "pns", "nw")
+
+
+def _map_file(shop: str = "woolworths") -> Path:
+    # Each shop has its own products, so its own list-item -> product matches.
+    return MAP_FILE if shop in ("", "woolworths") else DATA / f"products_{shop}.json"
+
+
+def load_map(shop: str = "woolworths") -> dict:
     try:
-        return json.loads(MAP_FILE.read_text())
+        return json.loads(_map_file(shop).read_text())
     except Exception:
         return {}
 
 
-def save_map(m: dict) -> None:
-    tmp = MAP_FILE.with_suffix(".tmp")
+def save_map(m: dict, shop: str = "woolworths") -> None:
+    f = _map_file(shop)
+    tmp = f.with_suffix(".tmp")
     tmp.write_text(json.dumps(m, indent=1, ensure_ascii=False))
-    tmp.replace(MAP_FILE)
+    tmp.replace(f)
 
 
 async def set_sensor(session: aiohttp.ClientSession, status: str, error: str = "") -> None:
@@ -549,6 +558,140 @@ async def orders() -> list:
     return out
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Pak'nSave and New World (Foodstuffs). Both run on one platform: an anonymous token from the shop's website,
+# then a shared API that takes a store id. Search and prices need no account.
+FS = {
+    "pns": {"site": "https://www.paknsave.co.nz", "name": "Pak'nSave", "banner": "PNS"},
+    "nw": {"site": "https://www.newworld.co.nz", "name": "New World", "banner": "MNW"},
+}
+FS_API = "https://api-prod.newworld.co.nz/v1/edge"
+FS_IMG = "https://a.fsimg.co.nz/product/retail/fan/image/400x400/{}.png"
+_fs_tok = {}  # shop -> (token, expires)
+
+
+async def _fs_token(http: aiohttp.ClientSession, shop: str) -> str:
+    t = _fs_tok.get(shop)
+    if t and t[1] > time.time() + 60:
+        return t[0]
+    async with http.post(FS[shop]["site"] + "/api/user/get-current-user", json={},
+                         headers={"origin": FS[shop]["site"], "referer": FS[shop]["site"] + "/"}) as r:
+        if r.status != 200:
+            raise RuntimeError(f"{FS[shop]['name']} didn't answer ({r.status})")
+        d = await r.json(content_type=None)
+    tok = d.get("access_token")
+    if not tok:
+        raise RuntimeError(f"{FS[shop]['name']} didn't give a token")
+    _fs_tok[shop] = (tok, time.time() + int(d.get("expires_in") or 1500))
+    return tok
+
+
+async def fs_call(shop: str, path: str, method: str = "GET", body=None):
+    """One call to the Foodstuffs API. Tried straight from Python first (fast); if the shop turns that away
+    it is made from inside the shop's website in the browser instead, as the site itself would."""
+    UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    try:
+        async with aiohttp.ClientSession(headers={"user-agent": UA}, timeout=aiohttp.ClientTimeout(total=40)) as http:
+            tok = await _fs_token(http, shop)
+            hdr = {"authorization": "Bearer " + tok, "accept": "application/json", "origin": FS[shop]["site"],
+                   "referer": FS[shop]["site"] + "/"}
+            async with http.request(method, FS_API + path, json=body, headers=hdr) as r:
+                if r.status == 401:
+                    _fs_tok.pop(shop, None)
+                if r.status != 200:
+                    raise RuntimeError(f"{r.status} {(await r.text())[:200]}")
+                return await r.json(content_type=None)
+    except Exception as e:
+        log("fs direct failed, using the browser:", repr(e)[:300])
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto(FS[shop]["site"])
+        await page.wait_for_timeout(3000)
+        res = await page.evaluate(PEEK_JS.replace(".slice(0, 12000)", ""), [FS_API + path, method, {}, body,
+                                  FS[shop]["site"] + "/api/user/get-current-user"])
+    if res.get("status") != 200:
+        raise RuntimeError(f"{FS[shop]['name']} said {res.get('status')}")
+    return json.loads(res.get("text") or "null")
+
+
+async def fs_stores(shop: str, q: str = "Hamilton") -> dict:
+    d = await fs_call(shop, "/store")
+    rows = d.get("stores") if isinstance(d, dict) else d
+    ql = (q or "").lower()
+    out = []
+    for st in rows or []:
+        pa = st.get("physicalAddress") or {}
+        hay = " ".join(str(x) for x in (st.get("name"), st.get("address"), pa.get("cityName"), pa.get("regionName"),
+                                         pa.get("suburb"))).lower()
+        if ql and ql not in hay:
+            continue
+        out.append({"id": st.get("id"), "name": st.get("name"), "address": st.get("address") or "",
+                    "click_collect": bool(st.get("clickAndCollect")), "delivery": bool(st.get("delivery")),
+                    "lat": st.get("latitude"), "lon": st.get("longitude")})
+    cur = load_prefs().get(shop + "_store")
+    log(shop, "stores", q, json.dumps(out, ensure_ascii=False)[:2000])
+    return {"shop": shop, "stores": out, "current": cur}
+
+
+def fs_store_set(shop: str, store: dict) -> dict:
+    prefs = load_prefs()
+    prefs[shop + "_store"] = {"id": str(store.get("id")), "name": str(store.get("name") or "")}
+    save_prefs(prefs)
+    return prefs[shop + "_store"]
+
+
+def _fs_product(p: dict) -> dict:
+    sp = p.get("singlePrice") or {}
+    cp = sp.get("comparativePrice") or {}
+    price = (sp.get("price") or 0) / 100
+    promo = None
+    for pr in p.get("promotions") or []:  # club card / multi-buy deals come through here
+        v = pr.get("rewardValue") or pr.get("price")
+        if isinstance(v, (int, float)) and 0 < v / 100 < price and not pr.get("threshold", 1) > 1:
+            promo = v / 100 if promo is None else min(promo, v / 100)
+    weight = p.get("saleType") in ("WEIGHT", "BOTH")
+    return {"sku": p.get("productId"), "name": p.get("name") or "", "brand": p.get("brand") or "",
+            "size": p.get("displayName") or "", "price": price, "sale_price": promo, "is_special": promo is not None,
+            "per_kg": weight and p.get("saleType") == "WEIGHT",
+            "unit_price": (cp.get("pricePerUnit") or 0) / 100 or None, "unit": cp.get("measureDescription") or "",
+            "supports_dual_pricing": p.get("saleType") == "BOTH",
+            "in_stock": "ONLINE" in (p.get("availability") or ["ONLINE"]),
+            "image": FS_IMG.format(str(p.get("productId") or "").split("-")[0])}
+
+
+async def fs_search(shop: str, q: str, limit: int = 20, store: str = "") -> list:
+    st = store or (load_prefs().get(shop + "_store") or {}).get("id")
+    if not st:
+        raise RuntimeError(f"Pick a {FS[shop]['name']} store first")
+    d = await fs_call(shop, "/search/paginated/products", "POST", {
+        "algoliaQuery": {"query": q}, "storeId": st, "hitsPerPage": max(1, min(int(limit), 50)), "page": 0,
+        "sortOrder": "NI_POPULARITY_ASC", "tobaccoQuery": False})
+    raw = d.get("products") or []
+    if raw and any(r.get("promotions") for r in raw):
+        log(shop, "promo sample", json.dumps(next(r for r in raw if r.get("promotions")), ensure_ascii=False)[:1500])
+    out = [_fs_product(p) for p in raw]
+    log(shop, "search", q, len(out), json.dumps(out[:2], ensure_ascii=False)[:600])
+    return out
+
+
+async def fs_prices(shop: str, skus: list) -> dict:
+    """Today's price for each matched product, for the side-by-side comparison."""
+    st = (load_prefs().get(shop + "_store") or {}).get("id")
+    if not st:
+        raise RuntimeError(f"Pick a {FS[shop]['name']} store first")
+    out = {}
+    for sku in skus[:80]:
+        try:
+            d = await fs_call(shop, "/search/paginated/products", "POST", {
+                "algoliaQuery": {"query": str(sku).split("-")[0]}, "storeId": st, "hitsPerPage": 5, "page": 0,
+                "sortOrder": "NI_POPULARITY_ASC", "tobaccoQuery": False})
+            hit = next((p for p in d.get("products") or [] if p.get("productId") == sku), None)
+            out[sku] = _fs_product(hit) if hit else None
+        except Exception as e:
+            out[sku] = {"error": friendly(e)}
+    return out
+
+
 PEEK_JS = """async ([url, method, headers, body, tokenFrom]) => {
   const h = Object.assign({"accept": "application/json", "content-type": "application/json"}, headers || {});
   if (tokenFrom) {  // a fresh anonymous token from the site's own endpoint, sent as a Bearer token
@@ -647,11 +790,14 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         return {"status": state["status"], "has_credentials": bool(OPTIONS.get("username")), "last_error": state["last_error"], "matches": len(load_map())}
     if op == "cart_get":
         return load_cart()
+    shop = str(req.get("shop") or "woolworths")
+    if shop not in SHOPS:
+        raise ValueError(f"Unknown shop: {shop}")
     if op == "map_get":
-        return load_map()
+        return load_map(shop)
     if op == "map_set":
-        # {"key": "milk", "match": {...}} sets one; "match": null forgets it.
-        m = load_map()
+        # {"key": "milk", "match": {...}, "shop": "pns"} sets one; "match": null forgets it.
+        m = load_map(shop)
         key = str(req.get("key", "")).strip().lower()
         if not key:
             raise ValueError("No item name given")
@@ -659,10 +805,11 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             m.pop(key, None)
         else:
             m[key] = req["match"]
-        save_map(m)
+        save_map(m, shop)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query", "peek"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query", "peek",
+                  "fs_stores", "fs_store_set", "fs_search", "fs_prices"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -676,6 +823,16 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             elif op == "peek":
                 out = await peek(str(req.get("site") or ""), str(req.get("url") or ""), str(req.get("method") or "GET"),
                                  req.get("headers") or {}, req.get("body"), str(req.get("token_from") or ""))
+            elif op in ("fs_stores", "fs_store_set", "fs_search", "fs_prices") and shop not in FS:
+                raise ValueError("Say which shop: pns or nw")
+            elif op == "fs_stores":
+                out = await fs_stores(shop, str(req.get("q") or "Hamilton"))
+            elif op == "fs_store_set":
+                out = fs_store_set(shop, req.get("store") or {})
+            elif op == "fs_search":
+                out = await fs_search(shop, str(req.get("q", "")), int(req.get("limit", 20)), str(req.get("store") or ""))
+            elif op == "fs_prices":
+                out = await fs_prices(shop, [str(x) for x in req.get("skus") or []])
             elif op == "query":
                 out = await query(str(req.get("q", "")), req.get("variables") or {})
             elif op == "slots":

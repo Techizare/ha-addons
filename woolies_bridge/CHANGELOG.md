@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+- Pak'nSave and New World (shop `pns` / `nw`): `fs_stores`, `fs_store_set`, `fs_search` and `fs_prices`. No account needed.
+- `map_get` and `map_set` take `shop`, so each shop keeps its own product matches.
+
 ## 0.2.9
 - `peek`: one read-only request from another shop's page (for working out Pak'nSave's search). `scan_js` takes a `url`.
 
