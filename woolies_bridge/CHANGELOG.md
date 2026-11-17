@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.9
+- `peek`: one read-only request from another shop's page (for working out Pak'nSave's search). `scan_js` takes a `url`.
+
 ## 0.2.8
 - `capture_page` takes `match` (a pattern for which requests to log) and works on other shops' sites, for working out Pak'nSave.
 

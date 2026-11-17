@@ -549,13 +549,40 @@ async def orders() -> list:
     return out
 
 
-async def scan_js(terms: list) -> dict:
+PEEK_JS = """async ([url, method, headers, body, tokenFrom]) => {
+  const h = Object.assign({"accept": "application/json", "content-type": "application/json"}, headers || {});
+  if (tokenFrom) {  // a fresh anonymous token from the site's own endpoint, sent as a Bearer token
+    const t = await (await fetch(tokenFrom, {method: "POST", credentials: "include", headers: {"content-type": "application/json"}, body: "{}"})).json();
+    if (t && t.access_token) h["authorization"] = "Bearer " + t.access_token;
+  }
+  const r = await fetch(url, {method: method || "GET", credentials: "include", headers: h, body: body ? JSON.stringify(body) : undefined});
+  return {status: r.status, text: (await r.text()).slice(0, 12000)};
+}"""
+
+
+async def peek(site: str, url: str, method: str, headers: dict, body, token_from: str) -> dict:
+    """For working out another shop's API: open its site, make one request from the page (as the site would) and
+    log the answer. Only GET, or POST to search/list endpoints, so nothing on an account changes."""
+    if method.upper() not in ("GET", "POST") or (method.upper() == "POST" and not re.search(r"search|product|store|list|get", url, re.I)):
+        raise ValueError("peek only reads")
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await page.goto(site)
+        await page.wait_for_timeout(4000)
+        res = await page.evaluate(PEEK_JS, [url, method.upper(), headers or {}, body, token_from])
+    txt = res.get("text") or ""
+    for i in range(0, len(txt), 2500):
+        log("peek", res.get("status"), i, txt[i:i + 2500])
+    return {"status": res.get("status"), "size": len(txt)}
+
+
+async def scan_js(terms: list, url: str = "") -> dict:
     """Search the website's own JavaScript for GraphQL operations (e.g. the slot booking mutation) and log
     each match with some text either side. Read-only: nothing is clicked or sent."""
     bs = BrowserSession(headless=True)
     found = {}
     async with bs as page:
-        await page.goto("https://www.woolworths.co.nz")
+        await page.goto(url or "https://www.woolworths.co.nz")
         await page.wait_for_timeout(6000)
         urls = await page.evaluate("""() => [...new Set([...document.scripts].map(s => s.src)
             .concat(performance.getEntriesByType('resource').map(e => e.name)).filter(u => /\\.js(\\?|$)/.test(u)))]""")
@@ -635,7 +662,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         save_map(m)
         return {"key": key, "match": m.get(key)}
 
-    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query"):
+    if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query", "peek"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -646,6 +673,9 @@ async def handle(session: aiohttp.ClientSession, req: dict):
                 out = await capture_page(str(req.get("url", "")), str(req.get("click", "")), str(req.get("match", "/api/")))
             elif op == "capture":
                 out = await capture(str(req.get("key", "")))
+            elif op == "peek":
+                out = await peek(str(req.get("site") or ""), str(req.get("url") or ""), str(req.get("method") or "GET"),
+                                 req.get("headers") or {}, req.get("body"), str(req.get("token_from") or ""))
             elif op == "query":
                 out = await query(str(req.get("q", "")), req.get("variables") or {})
             elif op == "slots":
@@ -657,7 +687,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             elif op == "slot_set":
                 out = await slot_set(str(req.get("slot") or ""))
             elif op == "scan_js":
-                out = await scan_js([str(t) for t in (req.get("terms") or [])][:6])
+                out = await scan_js([str(t) for t in (req.get("terms") or [])][:6], str(req.get("url") or ""))
             elif op == "login":
                 bs = BrowserSession(headless=True)
                 async with bs as page:
