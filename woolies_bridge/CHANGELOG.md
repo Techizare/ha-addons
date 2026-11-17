@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.8
+- `capture_page` takes `match` (a pattern for which requests to log) and works on other shops' sites, for working out Pak'nSave.
+
 ## 0.2.7
 - `orders`: placed orders that haven't arrived yet (number, delivery or pickup, time, store, total), kept on the sensor as `orders` so Home Assistant can put them on the Calendar.
 

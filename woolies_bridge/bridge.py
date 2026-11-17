@@ -307,14 +307,14 @@ async def diag() -> dict:
     return d
 
 
-async def capture_page(url: str, click: str = "") -> dict:
+async def capture_page(url: str, click: str = "", match: str = "/api/") -> dict:
     """Open a Woolworths page (optionally click a button/link by text) and log the GraphQL calls it makes:
     operation name, request body and the start of the answer. For working out the site's API. No cookies logged."""
     bs = BrowserSession(headless=True)
     calls = []
 
     def on_req(r):
-        if "/api/" in r.url and len(calls) < 30:
+        if re.search(match or "/api/", r.url) and r.resource_type in ("fetch", "xhr") and len(calls) < 30:
             calls.append(r)
 
     async with bs as page:
@@ -331,7 +331,8 @@ async def capture_page(url: str, click: str = "") -> dict:
         out = []
         for r in calls:
             resp = await r.response()
-            out.append({"op": r.headers.get("wnzx-operation-name") or r.url.split("?")[0][-50:],
+            out.append({"op": r.headers.get("wnzx-operation-name") or (r.method + " " + r.url[:160]),
+                        "hdrs": sorted(k for k in r.headers if k.lower() in ("authorization", "x-api-key", "access_token") or k.lower().startswith("x-")),
                         "status": resp.status if resp else None, "body": (r.post_data or "")[:1200],
                         "resp": ((await resp.text()) if resp else "")[:1500]})
     for c in out:
@@ -642,7 +643,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             if op == "diag":
                 out = await diag()
             elif op == "capture_page":
-                out = await capture_page(str(req.get("url", "")), str(req.get("click", "")))
+                out = await capture_page(str(req.get("url", "")), str(req.get("click", "")), str(req.get("match", "/api/")))
             elif op == "capture":
                 out = await capture(str(req.get("key", "")))
             elif op == "query":
