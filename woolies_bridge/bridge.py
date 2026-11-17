@@ -726,6 +726,27 @@ async def fs_prices(shop: str) -> dict:
     return {"map": m, "changed": changed, "missing": gone}
 
 
+async def w_prices() -> dict:
+    """Today's Woolworths price for every matched product, saved back into the matches."""
+    m = load_map()
+    changed = 0
+    for key, mt in m.items():
+        if not isinstance(mt, dict) or mt.get("skip") or not mt.get("sku"):
+            continue
+        try:
+            p = await client.get_product(str(mt["sku"]))
+        except Exception as e:
+            log("woolworths price check failed", key, repr(e)[:200])
+            continue
+        price = p.get("sale_price") if p.get("is_special") and p.get("sale_price") else p.get("price")
+        if not price:
+            continue
+        changed += price != mt.get("price")
+        mt.update({"price": price, "at": time.strftime("%Y-%m-%d"), "in_stock": p.get("in_stock")})
+    save_map(m)
+    return {"map": m, "changed": changed}
+
+
 async def fs_suggest(shop: str, items: list) -> dict:
     """First guesses for list items with no match yet: search each name and take the most popular product,
     preferring the same pack size as the Woolworths match. Saved marked as a guess, to be checked."""
@@ -869,7 +890,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         return {"key": key, "match": m.get(key)}
 
     if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query", "peek",
-                  "fs_stores", "fs_store_set", "fs_search", "fs_prices", "fs_suggest"):
+                  "fs_stores", "fs_store_set", "fs_search", "fs_prices", "fs_suggest", "w_prices"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -893,6 +914,8 @@ async def handle(session: aiohttp.ClientSession, req: dict):
                 out = await fs_search(shop, str(req.get("q", "")), int(req.get("limit", 20)), str(req.get("store") or ""))
             elif op == "fs_prices":
                 out = await fs_prices(shop)
+            elif op == "w_prices":
+                out = await w_prices()
             elif op == "fs_suggest":
                 out = await fs_suggest(shop, req.get("items") or [])
             elif op == "query":

@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.2
+- `w_prices` refreshes today's Woolworths price for every saved match, so the comparison is fair.
+
 ## 0.3.1
 - `fs_suggest`: first-guess Pak'nSave / New World matches for unmatched list items (marked as guesses).
 - `fs_prices` refreshes the price of every saved match at the chosen store.
