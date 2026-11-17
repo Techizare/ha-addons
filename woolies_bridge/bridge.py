@@ -89,6 +89,7 @@ async def set_sensor(session: aiohttp.ClientSession, status: str, error: str = "
             "last_ok": state["last_ok"],
             "matches": len(load_map()),
             "cart": load_cart(),
+            "pns_cart": load_pns_cart(),
             "orders": load_orders(),
         },
     }
@@ -822,7 +823,16 @@ async def _pns_save(page):
 
 
 async def _pns_calls(page, calls: list) -> dict:
-    return await page.evaluate(PNS_CALL_JS, [calls])
+    # The site sometimes reloads itself right after opening (it lines the trolley's store up with its cookie),
+    # which cuts off a call made at that moment; wait for the reload and try again.
+    for n in range(3):
+        try:
+            return await page.evaluate(PNS_CALL_JS, [calls])
+        except Exception as e:
+            if n == 2 or not re.search(r"context was destroyed|navigation", str(e), re.I):
+                raise
+            await page.wait_for_load_state("load")
+            await page.wait_for_timeout(2500)
 
 
 async def _pns_signin(page) -> str:
@@ -870,16 +880,34 @@ async def pns_session(fn):
             await _pns_save(page)
 
 
+PNS_CART_FILE = DATA / "pns_cart.json"
+
+
+def load_pns_cart() -> dict:
+    try:
+        return json.loads(PNS_CART_FILE.read_text())
+    except Exception:
+        return {}
+
+
 def _pns_cart_summary(d) -> dict:
+    """The trolley in the same shape as the Woolworths one (sensor attribute pns_cart), so one card shows both."""
     d = d if isinstance(d, dict) else {}
-    items = []
+    lines = []
     for p in d.get("products") or []:
-        items.append({"sku": p.get("productId"), "name": " ".join(x for x in (p.get("brand"), p.get("name")) if x),
-                      "size": p.get("displayName") or "", "qty": p.get("quantity"), "sale_type": p.get("sale_type") or p.get("saleType"),
-                      "price_cents": p.get("price"), "image": FS_IMG.format(str(p.get("productId") or "").split("-")[0])})
+        kg = (p.get("sale_type") or p.get("saleType")) == "WEIGHT"
+        q = p.get("quantity") or 0
+        lines.append({"variant": p.get("productId"), "name": p.get("name") or "", "brand": p.get("brand") or "",
+                      "qty": round(q / 1000, 2) if kg else q, "kg": kg, "cents": p.get("price")})
+    fees = [{"type": t, "cents": d.get(k)} for k, t in (("serviceFee", "Click & collect"), ("bagFee", "Bags")) if d.get(k)]
     st = d.get("store") or {}
-    return {"items": items, "store": st.get("storeName") or st.get("name") or "", "store_id": st.get("storeId") or st.get("id"),
-            "subtotal_cents": (d.get("subtotal") if isinstance(d.get("subtotal"), int) else None), "raw_keys": list(d.keys())[:30]}
+    sub = d.get("subtotal") if isinstance(d.get("subtotal"), int) else None
+    out = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "lines": lines, "fees": fees, "store": st.get("storeName") or "",
+           "store_id": st.get("storeId"), "subtotal_cents": sub,
+           "total_cents": None if sub is None else sub + sum(f["cents"] for f in fees),
+           "issues": [f"{(u.get('name') or u.get('productId'))} isn't available" for u in d.get("unavailableProducts") or []][:5]}
+    PNS_CART_FILE.write_text(json.dumps(out, ensure_ascii=False))
+    return out
 
 
 async def pns_cart() -> dict:
@@ -906,7 +934,7 @@ async def pns_add(items: list) -> dict:
         prods = []
         for it in items:
             weight = it.get("sale_type") == "WEIGHT"
-            q = float(it.get("qty") or 1)
+            q = float(it.get("qty") if it.get("qty") is not None else 1)
             prods.append({"productId": it["sku"], "quantity": int(round(q * 1000)) if weight else int(round(q)),
                           "sale_type": "WEIGHT" if weight else "UNITS"})
         r = (await _pns_calls(page, [{"url": FS_API + "/cart", "method": "POST", "body": {"products": prods, "allowSubstitutions": True}}]))["out"][0]
@@ -915,8 +943,9 @@ async def pns_add(items: list) -> dict:
             msg = r["data"].get("message") if isinstance(r["data"], dict) else str(r["data"])[:200]
             return {"added": [], "failed": [{"ref": it.get("ref"), "error": msg or f"Pak'nSave said {r['status']}"} for it in items]}
         have = {p.get("productId") for p in (r["data"] or {}).get("products") or []} if isinstance(r["data"], dict) else set()
-        return {"added": [it.get("ref") for it in items if it["sku"] in have],
-                "failed": [{"ref": it.get("ref"), "error": "Not in the trolley afterwards"} for it in items if it["sku"] not in have],
+        want = [it for it in items if float(it.get("qty") or 0) > 0]
+        return {"added": [it.get("ref") for it in want if it["sku"] in have],
+                "failed": [{"ref": it.get("ref"), "error": "Not in the trolley afterwards"} for it in want if it["sku"] not in have],
                 "cart": _pns_cart_summary(r["data"])}
     return await pns_session(go)
 

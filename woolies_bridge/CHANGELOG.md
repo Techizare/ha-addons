@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.6
+- Pak'nSave trolley kept on sensor.woolies_bridge attribute `pns_cart` (same shape as `cart`). Quantity 0 removes a line. Calls retry when the site reloads itself.
+
 ## 0.3.5
 - Pak'nSave trolley: `pns_login`, `pns_cart` and `pns_add` (signs in through the Club+ page; session kept in /data/pns_cookies.json).
 
