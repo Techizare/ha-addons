@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.5
+- Pak'nSave trolley: `pns_login`, `pns_cart` and `pns_add` (signs in through the Club+ page; session kept in /data/pns_cookies.json).
+
 ## 0.3.4
 - Fix: the empty Pak'nSave login fields stopped the update (an empty email isn't valid). They're optional now, under "Show unused optional configuration options".
 

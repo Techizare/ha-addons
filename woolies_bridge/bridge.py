@@ -773,6 +773,160 @@ async def fs_suggest(shop: str, items: list) -> dict:
     return {"map": m, "made": made}
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Pak'nSave trolley (needs paknsave_username / paknsave_password). Signing in goes through Foodstuffs' Club+
+# login page in the browser; the site's own cookies (a 14-day refresh token) are kept in /data so later calls
+# skip the login. Every trolley call is made from inside paknsave.co.nz with the signed-in token, as the site does.
+PNS_COOKIES = DATA / "pns_cookies.json"
+PNS_SITE = "https://www.paknsave.co.nz"
+PNS_LOGIN = "https://login.clubplus.co.nz/?banner=PNS&channel=WEB"
+
+PNS_CALL_JS = """async ([calls]) => {
+  const t = await (await fetch("/api/user/get-current-user", {method: "POST", credentials: "include",
+      headers: {"content-type": "application/json"}, body: "{}"})).json();
+  const tok = t && t.access_token;
+  let who = "anonymous";
+  try { who = JSON.parse(atob(tok.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).email || "anonymous"; } catch (e) {}
+  const out = [];
+  for (const c of calls || []) {
+    const r = await fetch(c.url, {method: c.method || "GET", credentials: "include",
+      headers: {"accept": "application/json", "content-type": "application/json", "authorization": "Bearer " + tok},
+      body: c.body ? JSON.stringify(c.body) : undefined});
+    const txt = await r.text();
+    let data = null; try { data = JSON.parse(txt); } catch (e) { data = txt.slice(0, 2000); }
+    out.push({status: r.status, data});
+  }
+  return {who, out};
+}"""
+
+
+def _pns_creds():
+    u, p = OPTIONS.get("paknsave_username"), OPTIONS.get("paknsave_password")
+    if not u or not p:
+        raise RuntimeError("Add your Pak'nSave email and password in the app's Configuration tab.")
+    return u, p
+
+
+async def _pns_open(page):
+    try:
+        await page.context.add_cookies(json.loads(PNS_COOKIES.read_text()))
+    except Exception:
+        pass
+    await page.goto(PNS_SITE)
+    await page.wait_for_timeout(2500)
+
+
+async def _pns_save(page):
+    ck = [c for c in await page.context.cookies() if re.search(r"paknsave|clubplus|foodstuffs", c.get("domain", ""))]
+    PNS_COOKIES.write_text(json.dumps(ck))
+
+
+async def _pns_calls(page, calls: list) -> dict:
+    return await page.evaluate(PNS_CALL_JS, [calls])
+
+
+async def _pns_signin(page) -> str:
+    """Sign in on the Club+ page. Logs what it sees at each step, so a changed page is easy to fix."""
+    u, p = _pns_creds()
+    await page.goto(PNS_LOGIN)
+    await page.wait_for_timeout(5000)
+    for step in range(4):
+        info = await page.evaluate("""() => ({url: location.href, inputs: [...document.querySelectorAll('input')].filter(i => i.offsetParent)
+            .map(i => [i.type, i.name, i.id, i.autocomplete].join('|')), buttons: [...document.querySelectorAll('button,[type=submit]')]
+            .filter(b => b.offsetParent).map(b => (b.innerText || b.value || '').trim().slice(0, 30))})""")
+        log("pns login step", step, json.dumps(info)[:800])
+        if "paknsave.co.nz" in info["url"]:
+            break
+        em = page.locator("input[type=email], input[name*=mail i], input[name=username], input[id*=mail i]").first
+        pw = page.locator("input[type=password]").first
+        if await em.count() and await em.is_visible() and not (await em.input_value()):
+            await em.fill(u)
+        if await pw.count() and await pw.is_visible():
+            await pw.fill(p)
+        btn = page.locator("button[type=submit], input[type=submit], button:has-text('Log in'), button:has-text('Sign in'), button:has-text('Continue'), button:has-text('Next')").first
+        if await btn.count():
+            await btn.click()
+        await page.wait_for_timeout(7000)
+    if "paknsave.co.nz" not in page.url:
+        await page.goto(PNS_SITE)
+        await page.wait_for_timeout(4000)
+    res = await _pns_calls(page, [])
+    log("pns signed in as", "a customer" if res["who"] != "anonymous" else "anonymous")
+    return res["who"]
+
+
+async def pns_session(fn):
+    """Open paknsave.co.nz signed in (signing in when the saved session has run out), then run fn(page)."""
+    bs = BrowserSession(headless=True)
+    async with bs as page:
+        await _pns_open(page)
+        if (await _pns_calls(page, []))["who"] == "anonymous":
+            if await _pns_signin(page) == "anonymous":
+                await _pns_save(page)
+                raise RuntimeError("Couldn't sign in to Pak'nSave. Check the email and password in the app's Configuration.")
+        try:
+            return await fn(page)
+        finally:
+            await _pns_save(page)
+
+
+def _pns_cart_summary(d) -> dict:
+    d = d if isinstance(d, dict) else {}
+    items = []
+    for p in d.get("products") or []:
+        items.append({"sku": p.get("productId"), "name": " ".join(x for x in (p.get("brand"), p.get("name")) if x),
+                      "size": p.get("displayName") or "", "qty": p.get("quantity"), "sale_type": p.get("sale_type") or p.get("saleType"),
+                      "price_cents": p.get("price"), "image": FS_IMG.format(str(p.get("productId") or "").split("-")[0])})
+    st = d.get("store") or {}
+    return {"items": items, "store": st.get("storeName") or st.get("name") or "", "store_id": st.get("storeId") or st.get("id"),
+            "subtotal_cents": (d.get("subtotal") if isinstance(d.get("subtotal"), int) else None), "raw_keys": list(d.keys())[:30]}
+
+
+async def pns_cart() -> dict:
+    async def go(page):
+        r = (await _pns_calls(page, [{"url": FS_API + "/cart"}]))["out"][0]
+        log("pns cart", r["status"], json.dumps(r["data"], ensure_ascii=False)[:2500])
+        if r["status"] != 200:
+            raise RuntimeError(f"Pak'nSave trolley said {r['status']}")
+        return _pns_cart_summary(r["data"])
+    return await pns_session(go)
+
+
+async def pns_add(items: list) -> dict:
+    """Put list items in the Pak'nSave trolley: [{ref, sku, qty, sale_type}] (qty in units, or kg for WEIGHT).
+    Sets each line to that quantity, at the chosen Pak'nSave store."""
+    store = _fs_store("pns")
+
+    async def go(page):
+        cur = (await _pns_calls(page, [{"url": FS_API + "/cart"}]))["out"][0]
+        cst = ((cur.get("data") or {}).get("store") or {}) if isinstance(cur.get("data"), dict) else {}
+        if (cst.get("storeId") or cst.get("id")) not in (None, store):
+            r = (await _pns_calls(page, [{"url": FS_API + f"/cart/store/{store}", "method": "POST", "body": {}}]))["out"][0]
+            log("pns cart store", r["status"], json.dumps(r["data"])[:400])
+        prods = []
+        for it in items:
+            weight = it.get("sale_type") == "WEIGHT"
+            q = float(it.get("qty") or 1)
+            prods.append({"productId": it["sku"], "quantity": int(round(q * 1000)) if weight else int(round(q)),
+                          "sale_type": "WEIGHT" if weight else "UNITS"})
+        r = (await _pns_calls(page, [{"url": FS_API + "/cart", "method": "POST", "body": {"products": prods, "allowSubstitutions": True}}]))["out"][0]
+        log("pns add", r["status"], json.dumps(r["data"], ensure_ascii=False)[:2500])
+        if r["status"] != 200:
+            msg = r["data"].get("message") if isinstance(r["data"], dict) else str(r["data"])[:200]
+            return {"added": [], "failed": [{"ref": it.get("ref"), "error": msg or f"Pak'nSave said {r['status']}"} for it in items]}
+        have = {p.get("productId") for p in (r["data"] or {}).get("products") or []} if isinstance(r["data"], dict) else set()
+        return {"added": [it.get("ref") for it in items if it["sku"] in have],
+                "failed": [{"ref": it.get("ref"), "error": "Not in the trolley afterwards"} for it in items if it["sku"] not in have],
+                "cart": _pns_cart_summary(r["data"])}
+    return await pns_session(go)
+
+
+async def pns_login() -> dict:
+    async def go(page):
+        return {"signed_in": True}
+    return await pns_session(go)
+
+
 PEEK_JS = """async ([url, method, headers, body, tokenFrom]) => {
   const h = Object.assign({"accept": "application/json", "content-type": "application/json"}, headers || {});
   if (tokenFrom) {  // a fresh anonymous token from the site's own endpoint, sent as a Bearer token
@@ -890,7 +1044,8 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         return {"key": key, "match": m.get(key)}
 
     if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query", "peek",
-                  "fs_stores", "fs_store_set", "fs_search", "fs_prices", "fs_suggest", "w_prices"):
+                  "fs_stores", "fs_store_set", "fs_search", "fs_prices", "fs_suggest", "w_prices",
+                  "pns_login", "pns_cart", "pns_add"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -914,6 +1069,12 @@ async def handle(session: aiohttp.ClientSession, req: dict):
                 out = await fs_search(shop, str(req.get("q", "")), int(req.get("limit", 20)), str(req.get("store") or ""))
             elif op == "fs_prices":
                 out = await fs_prices(shop)
+            elif op == "pns_login":
+                out = await pns_login()
+            elif op == "pns_cart":
+                out = await pns_cart()
+            elif op == "pns_add":
+                out = await pns_add(req.get("items", []) or [])
             elif op == "w_prices":
                 out = await w_prices()
             elif op == "fs_suggest":
