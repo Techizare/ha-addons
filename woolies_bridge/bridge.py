@@ -656,13 +656,12 @@ def _fs_product(p: dict) -> dict:
             "unit_price": (cp.get("pricePerUnit") or 0) / 100 or None, "unit": cp.get("measureDescription") or "",
             "supports_dual_pricing": p.get("saleType") == "BOTH",
             "in_stock": "ONLINE" in (p.get("availability") or ["ONLINE"]),
+            "avg_g": (p.get("variableWeight") or {}).get("averageWeight"),
             "image": FS_IMG.format(str(p.get("productId") or "").split("-")[0])}
 
 
 async def fs_search(shop: str, q: str, limit: int = 20, store: str = "") -> list:
-    st = store or (load_prefs().get(shop + "_store") or {}).get("id")
-    if not st:
-        raise RuntimeError(f"Pick a {FS[shop]['name']} store first")
+    st = store or _fs_store(shop)
     d = await fs_call(shop, "/search/paginated/products", "POST", {
         "algoliaQuery": {"query": q}, "storeId": st, "hitsPerPage": max(1, min(int(limit), 50)), "page": 0,
         "sortOrder": "NI_POPULARITY_ASC", "tobaccoQuery": False})
@@ -674,22 +673,83 @@ async def fs_search(shop: str, q: str, limit: int = 20, store: str = "") -> list
     return out
 
 
-async def fs_prices(shop: str, skus: list) -> dict:
-    """Today's price for each matched product, for the side-by-side comparison."""
+async def _fs_find(shop: str, store: str, q: str, n: int = 10) -> list:
+    d = await fs_call(shop, "/search/paginated/products", "POST", {
+        "algoliaQuery": {"query": q}, "storeId": store, "hitsPerPage": n, "page": 0,
+        "sortOrder": "NI_POPULARITY_ASC", "tobaccoQuery": False})
+    return [_fs_product(p) for p in d.get("products") or []]
+
+
+def _fs_store(shop: str) -> str:
     st = (load_prefs().get(shop + "_store") or {}).get("id")
     if not st:
         raise RuntimeError(f"Pick a {FS[shop]['name']} store first")
-    out = {}
-    for sku in skus[:80]:
+    return st
+
+
+def _size_key(x: str) -> str:
+    x = re.sub(r"\s+", "", str(x or "").lower())
+    return {"each": "ea", "1ea": "ea", "perkg": "kg", "1kg": "kg"}.get(x, x)
+
+
+def _as_match(p: dict, guess: bool = False) -> dict:
+    m = {k: p.get(k) for k in ("sku", "name", "brand", "size", "per_kg", "avg_g", "unit_price", "unit")}
+    m["price"] = p["sale_price"] if p.get("is_special") and p.get("sale_price") else p.get("price")
+    m["at"] = time.strftime("%Y-%m-%d")
+    if guess:
+        m["guess"] = True
+    return m
+
+
+async def fs_prices(shop: str) -> dict:
+    """Today's price for every matched product at the chosen store, saved back into the matches."""
+    st, m = _fs_store(shop), load_map(shop)
+    changed = gone = 0
+    for key, mt in m.items():
+        if not isinstance(mt, dict) or mt.get("skip") or not mt.get("sku"):
+            continue
         try:
-            d = await fs_call(shop, "/search/paginated/products", "POST", {
-                "algoliaQuery": {"query": str(sku).split("-")[0]}, "storeId": st, "hitsPerPage": 5, "page": 0,
-                "sortOrder": "NI_POPULARITY_ASC", "tobaccoQuery": False})
-            hit = next((p for p in d.get("products") or [] if p.get("productId") == sku), None)
-            out[sku] = _fs_product(hit) if hit else None
+            hit = next((p for p in await _fs_find(shop, st, " ".join(x for x in (mt.get("brand"), mt.get("name")) if x), 20)
+                        if p["sku"] == mt["sku"]), None)
         except Exception as e:
-            out[sku] = {"error": friendly(e)}
-    return out
+            log(shop, "price check failed", key, repr(e)[:200])
+            continue
+        if not hit:
+            mt["missing"] = True
+            gone += 1
+            continue
+        new = _as_match(hit, bool(mt.get("guess")))
+        changed += new["price"] != mt.get("price")
+        mt.pop("missing", None)
+        mt.update(new)
+    save_map(m, shop)
+    return {"map": m, "changed": changed, "missing": gone}
+
+
+async def fs_suggest(shop: str, items: list) -> dict:
+    """First guesses for list items with no match yet: search each name and take the most popular product,
+    preferring the same pack size as the Woolworths match. Saved marked as a guess, to be checked."""
+    st, m = _fs_store(shop), load_map(shop)
+    made = 0
+    for it in items[:60]:
+        key = str(it.get("key") or "").strip().lower()
+        q = str(it.get("q") or key).strip()
+        if not key or not q or key in m:
+            continue
+        try:
+            res = [p for p in await _fs_find(shop, st, q, 10) if p.get("in_stock") is not False]
+        except Exception as e:
+            log(shop, "suggest failed", q, repr(e)[:200])
+            continue
+        if not res:
+            continue
+        want = _size_key(it.get("size"))
+        pick = next((p for p in res if want and _size_key(p["size"]) == want), res[0])
+        m[key] = _as_match(pick, True)
+        made += 1
+    save_map(m, shop)
+    log(shop, "suggested", made)
+    return {"map": m, "made": made}
 
 
 PEEK_JS = """async ([url, method, headers, body, tokenFrom]) => {
@@ -809,7 +869,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
         return {"key": key, "match": m.get(key)}
 
     if op not in ("login", "search", "cart", "add", "diag", "capture", "capture_page", "cart_set", "slots", "slot_set", "stores", "orders", "scan_js", "query", "peek",
-                  "fs_stores", "fs_store_set", "fs_search", "fs_prices"):
+                  "fs_stores", "fs_store_set", "fs_search", "fs_prices", "fs_suggest"):
         raise ValueError(f"Unknown request: {op}")
     async with lock:
         await set_sensor(session, "working")
@@ -823,7 +883,7 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             elif op == "peek":
                 out = await peek(str(req.get("site") or ""), str(req.get("url") or ""), str(req.get("method") or "GET"),
                                  req.get("headers") or {}, req.get("body"), str(req.get("token_from") or ""))
-            elif op in ("fs_stores", "fs_store_set", "fs_search", "fs_prices") and shop not in FS:
+            elif op in ("fs_stores", "fs_store_set", "fs_search", "fs_prices", "fs_suggest") and shop not in FS:
                 raise ValueError("Say which shop: pns or nw")
             elif op == "fs_stores":
                 out = await fs_stores(shop, str(req.get("q") or "Hamilton"))
@@ -832,7 +892,9 @@ async def handle(session: aiohttp.ClientSession, req: dict):
             elif op == "fs_search":
                 out = await fs_search(shop, str(req.get("q", "")), int(req.get("limit", 20)), str(req.get("store") or ""))
             elif op == "fs_prices":
-                out = await fs_prices(shop, [str(x) for x in req.get("skus") or []])
+                out = await fs_prices(shop)
+            elif op == "fs_suggest":
+                out = await fs_suggest(shop, req.get("items") or [])
             elif op == "query":
                 out = await query(str(req.get("q", "")), req.get("variables") or {})
             elif op == "slots":

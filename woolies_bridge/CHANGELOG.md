@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+- `fs_suggest`: first-guess Pak'nSave / New World matches for unmatched list items (marked as guesses).
+- `fs_prices` refreshes the price of every saved match at the chosen store.
+
 ## 0.3.0
 - Pak'nSave and New World (shop `pns` / `nw`): `fs_stores`, `fs_store_set`, `fs_search` and `fs_prices`. No account needed.
 - `map_get` and `map_set` take `shop`, so each shop keeps its own product matches.
