@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.4
+- Fix: the empty Pak'nSave login fields stopped the update (an empty email isn't valid). They're optional now, under "Show unused optional configuration options".
+
 ## 0.3.3
 - Configuration has `paknsave_username` / `paknsave_password` (Pak'nSave online shopping login), ready for filling a Pak'nSave trolley. Not used yet.
 
