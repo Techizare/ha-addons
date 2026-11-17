@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.3
+- Configuration has `paknsave_username` / `paknsave_password` (Pak'nSave online shopping login), ready for filling a Pak'nSave trolley. Not used yet.
+
 ## 0.3.2
 - `w_prices` refreshes today's Woolworths price for every saved match, so the comparison is fair.
 
